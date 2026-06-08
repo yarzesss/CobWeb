@@ -19,7 +19,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import Depends, HTTPException, Security
+from fastapi import HTTPException, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel
