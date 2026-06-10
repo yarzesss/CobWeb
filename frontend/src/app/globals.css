@@ -1,0 +1,131 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --cobweb-bg: #0d0d18;
+  --cobweb-surface: #1a1a2e;
+  --cobweb-pink: #c2185b;
+}
+
+* {
+  image-rendering: pixelated;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  @apply bg-cobweb-bg text-gray-100 font-sans antialiased;
+  background-image:
+    linear-gradient(rgba(194, 24, 91, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(194, 24, 91, 0.03) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+@layer components {
+  .pixel-border {
+    @apply border-2 border-cobweb-border;
+    box-shadow: 4px 4px 0 0 rgba(194, 24, 91, 0.45);
+  }
+
+  .pixel-border-sm {
+    @apply border-2 border-cobweb-border;
+    box-shadow: 2px 2px 0 0 rgba(194, 24, 91, 0.35);
+  }
+
+  .pixel-card {
+    @apply bg-cobweb-surface pixel-border rounded-none;
+  }
+
+  .pixel-btn {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2
+      font-pixel text-[10px] uppercase tracking-wider
+      bg-cobweb-pink text-white border-2 border-cobweb-pink-dark
+      shadow-pixel-sm transition-all
+      hover:bg-cobweb-pink-light hover:-translate-y-0.5
+      active:translate-y-0 active:shadow-none
+      disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:translate-y-0;
+  }
+
+  .pixel-btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2
+      font-pixel text-[10px] uppercase tracking-wider
+      bg-cobweb-surface2 text-gray-200 border-2 border-cobweb-border
+      shadow-pixel-sm transition-all
+      hover:border-cobweb-pink hover:text-cobweb-pink-light
+      disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .pixel-input {
+    @apply w-full bg-cobweb-bg border-2 border-cobweb-border px-4 py-3
+      font-mono text-sm text-gray-100 placeholder:text-gray-500
+      focus:outline-none focus:border-cobweb-pink focus:shadow-pixel-sm;
+  }
+
+  .pixel-tab {
+    @apply px-4 py-2 font-pixel text-[9px] uppercase tracking-wider
+      border-2 border-transparent text-gray-400 transition-colors;
+  }
+
+  .pixel-tab-active {
+    @apply pixel-tab border-cobweb-pink bg-cobweb-pink/10 text-cobweb-pink-light;
+  }
+
+  .scanlines::after {
+    content: '';
+    pointer-events: none;
+    position: absolute;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0, 0, 0, 0.08) 2px,
+      rgba(0, 0, 0, 0.08) 4px
+    );
+  }
+}
+
+/* Wallet adapter overrides */
+.wallet-adapter-button {
+  font-family: var(--font-pixel) !important;
+  font-size: 10px !important;
+  text-transform: uppercase !important;
+  background-color: #c2185b !important;
+  border: 2px solid #880e4f !important;
+  border-radius: 0 !important;
+  height: auto !important;
+  padding: 8px 16px !important;
+  line-height: 1.4 !important;
+}
+
+.wallet-adapter-modal-wrapper {
+  background: rgba(13, 13, 24, 0.92) !important;
+}
+
+.wallet-adapter-modal {
+  background: #1a1a2e !important;
+  border: 2px solid #3d3d5c !important;
+  border-radius: 0 !important;
+  font-family: var(--font-sans) !important;
+}
+
+.wallet-adapter-modal-title {
+  font-family: var(--font-pixel) !important;
+  font-size: 12px !important;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #1a1a2e;
+}
+::-webkit-scrollbar-thumb {
+  background: #c2185b;
+  border: 2px solid #1a1a2e;
+}
