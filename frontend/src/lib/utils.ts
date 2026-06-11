@@ -24,6 +24,15 @@ export function formatPercent(value: number | undefined | null): string {
   return `${(value * 100).toFixed(1)}%`;
 }
 
+export function formatTokenAmount(value: number | undefined | null): string {
+  if (value == null || Number.isNaN(value)) return '—';
+  const abs = Math.abs(value);
+  if (abs >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(2)}B`;
+  if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+  if (abs >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  return value.toFixed(2);
+}
+
 export function formatScore(score: number): string {
   return `${Math.round(score)}`;
 }

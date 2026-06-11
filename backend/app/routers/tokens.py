@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 
 from app.services.helius import get_helius_client
 from app.services.cabal import analyze_cabal
@@ -12,54 +12,36 @@ from app.services.classifier import compute_dev_risk, classify_dev_risk
 
 router = APIRouter(prefix="/token", tags=["Token"])
 
-
-def _validate_ca(ca: str) -> None:
-    if not (32 <= len(ca) <= 44) or not ca.isalnum():
-        raise HTTPException(status_code=400, detail="Invalid contract address")
+# A buyer with smart_money_score >= this is shown in the Smart Money tab
+SMART_MONEY_THRESHOLD = 55
 
 
-async def _get_dev_risk(
-    dev_wallet: Optional[str],
-    ca: Optional[str] = None,
-    launch_ts: Optional[int] = None,
-) -> Dict[str, Any]:
+async def _get_dev_risk(dev_wallet: str | None) -> Dict[str, Any]:
     if not dev_wallet:
         return {"score": 0, "level": "LOW", "dev_wallet": None}
 
     helius = get_helius_client()
-    txs = await helius.get_wallet_transactions(dev_wallet, limit=300)
-    txs = sorted(txs, key=lambda t: t.get("timestamp") or 0)
-
-    # Distinct tokens the deployer has touched (rough serial-deployer proxy)
+    txs = await helius.get_wallet_transactions(dev_wallet, limit=200)
     seen_tokens: set[str] = set()
-    for tx in txs:
+    quick_sells = 0
+    sorted_txs = sorted(txs, key=lambda t: t.get("timestamp") or 0)
+
+    for tx in sorted_txs:
         for transfer in tx.get("tokenTransfers") or []:
             mint = transfer.get("mint")
             if mint:
                 seen_tokens.add(mint)
+
     dev_prev_tokens = len(seen_tokens)
+    for tx in sorted_txs[:20]:
+        for transfer in tx.get("tokenTransfers") or []:
+            if transfer.get("fromUserAccount") == dev_wallet:
+                quick_sells += 1
 
-    # Did the dev SELL this specific token within 24h of its launch?
-    quick_sell = False
-    if ca and launch_ts:
-        deadline = launch_ts + 24 * 3600
-        for tx in txs:
-            ts = tx.get("timestamp") or 0
-            if ts > deadline:
-                break
-            for transfer in tx.get("tokenTransfers") or []:
-                if (
-                    transfer.get("mint") == ca
-                    and transfer.get("fromUserAccount") == dev_wallet
-                ):
-                    quick_sell = True
-                    break
-            if quick_sell:
-                break
-
+    dev_sells_within_hours = 1.0 if quick_sells > 3 else None
     score = compute_dev_risk(
-        dev_rug_count=0,  # TODO: rug DB integration
-        dev_sells_within_hours=1.0 if quick_sell else None,
+        dev_rug_count=0,
+        dev_sells_within_hours=dev_sells_within_hours,
         dev_prev_tokens=dev_prev_tokens,
         connected_to_known_scammers=False,
     )
@@ -68,33 +50,32 @@ async def _get_dev_risk(
         "level": classify_dev_risk(score),
         "dev_wallet": dev_wallet,
         "dev_prev_tokens": dev_prev_tokens,
-        "quick_sell_signal": quick_sell,
+        "quick_sell_signal": quick_sells > 3,
     }
 
 
 def _enrich_buyers(
     early_buyers: List[Dict[str, Any]],
     cabal: Dict[str, Any],
-    launch_slot: Optional[int] = None,
-    launch_ts: Optional[int] = None,
+    token_supply: float = 0.0,
+    sol_price_usd: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """
-    Enrich early buyers with computed signals:
-    - blocks/seconds after launch
-    - bot_score (timing-based)
-    - archetype (sniper / insider / unknown)
-    - smart_money_score and cluster membership
+    Enrich early buyers with computed data:
+    - entry_price_sol / entry_market_cap_usd: derived from sol_spent / tokens bought
+    - amount_usd: position size in USD at entry
+    - bot_score: based on how many blocks after launch they bought
+    - archetype + category: bot / cluster / smart_money / regular
+    - cluster membership
     """
     if not early_buyers:
         return []
 
+    # Find launch slot = the very first buyer's slot
     valid_slots = [b.get("slot") for b in early_buyers if b.get("slot")]
-    if launch_slot is None:
-        launch_slot = min(valid_slots) if valid_slots else None
-    valid_ts = [b.get("timestamp") for b in early_buyers if b.get("timestamp")]
-    if launch_ts is None:
-        launch_ts = min(valid_ts) if valid_ts else None
+    launch_slot = min(valid_slots) if valid_slots else 0
 
+    # Build cluster lookup
     cluster_wallet_map: Dict[str, Dict[str, Any]] = {}
     for i, cluster in enumerate(cabal.get("clusters") or []):
         for w in cluster.get("wallets") or []:
@@ -104,61 +85,92 @@ def _enrich_buyers(
                 "cluster_type": cluster.get("cluster_type", "unknown"),
             }
 
+    # Median position size — conviction reference point
+    sol_sizes = sorted(b.get("sol_spent") or 0 for b in early_buyers)
+    median_sol = sol_sizes[len(sol_sizes) // 2] if sol_sizes else 0.0
+
     enriched = []
     for buyer in early_buyers:
         wallet = buyer.get("wallet")
-        slot = buyer.get("slot")
-        ts = buyer.get("timestamp")
-
-        blocks_after = (slot - launch_slot) if (slot and launch_slot) else None
-        seconds_after = (ts - launch_ts) if (ts and launch_ts) else None
-
+        slot = buyer.get("slot") or 0
+        blocks_after = max(0, slot - launch_slot) if launch_slot else 0
         in_cluster = wallet in cluster_wallet_map
         cluster_info = cluster_wallet_map.get(wallet, {})
-        cluster_suspicion = cluster_info.get("suspicion_score") or 0
+        suspicious_cluster = in_cluster and (cluster_info.get("suspicion_score") or 0) >= 70
 
-        # Bot score from entry timing (block-level beats second-level)
-        if (blocks_after is not None and blocks_after < 3) or (
-            seconds_after is not None and seconds_after < 2
-        ):
+        sol_spent = float(buyer.get("sol_spent") or 0)
+        token_amount = float(buyer.get("amount") or 0)
+
+        # ── Entry price & market cap ─────────────────────────────────────────
+        entry_price_sol = sol_spent / token_amount if token_amount > 0 else None
+        entry_market_cap_usd = None
+        if entry_price_sol is not None and token_supply > 0 and sol_price_usd > 0:
+            entry_market_cap_usd = round(entry_price_sol * token_supply * sol_price_usd, 2)
+        amount_usd = round(sol_spent * sol_price_usd, 2) if sol_price_usd > 0 else None
+
+        # ── Bot score: the earlier relative to launch, the more bot-like ────
+        if blocks_after < 3:
             bot_score = 85
-        elif (blocks_after is not None and blocks_after < 10) or (
-            seconds_after is not None and seconds_after < 10
-        ):
+        elif blocks_after < 10:
             bot_score = 65
-        elif (blocks_after is not None and blocks_after < 30) or (
-            seconds_after is not None and seconds_after < 60
-        ):
+        elif blocks_after < 30:
             bot_score = 35
         else:
             bot_score = 12
 
-        # Archetype
+        # ── Smart money score: conviction + organic timing + independence ───
+        if bot_score >= 60:
+            smart_money_score = 0
+        elif suspicious_cluster:
+            smart_money_score = 15  # coordinated, not independently "smart"
+        else:
+            smart_money_score = 20
+            if blocks_after >= 30:
+                smart_money_score += 15  # organic timing, not sniping
+            if median_sol > 0 and sol_spent >= median_sol * 2:
+                smart_money_score += 30  # strong conviction vs peers
+            elif median_sol > 0 and sol_spent >= median_sol:
+                smart_money_score += 10
+            if not in_cluster:
+                smart_money_score += 10
+            smart_money_score = min(smart_money_score, 100)
+
+        # ── Archetype ────────────────────────────────────────────────────────
         if bot_score >= 60:
             archetype = "bot"
-        elif blocks_after is not None and blocks_after < 5:
+        elif blocks_after < 5:
             archetype = "sniper"
-        elif in_cluster and cluster_suspicion >= 70:
+        elif suspicious_cluster:
             archetype = "insider"
         elif in_cluster:
             archetype = "swing_trader"
+        elif smart_money_score >= SMART_MONEY_THRESHOLD:
+            archetype = "accumulator"
         else:
             archetype = "unknown"
 
-        # Smart money: not a bot, not part of a suspicious cluster
+        # ── Category: ONE bucket per wallet — tabs never overlap ────────────
         if bot_score >= 60:
-            smart_money_score = 0
-        elif in_cluster and cluster_suspicion >= 70:
-            smart_money_score = 15
+            category = "bot"
+        elif suspicious_cluster:
+            category = "cluster"
+        elif smart_money_score >= SMART_MONEY_THRESHOLD:
+            category = "smart_money"
         else:
-            smart_money_score = max(0, 60 - bot_score)
+            category = "regular"
 
         enriched.append({
             **buyer,
+            "amount_tokens": token_amount,
+            "amount_usd": amount_usd,
+            "sol_spent": sol_spent,
+            "entry_price_sol": entry_price_sol,
+            "entry_market_cap_usd": entry_market_cap_usd,
+            "market_cap_usd": entry_market_cap_usd,  # frontend compat alias
             "blocks_after_launch": blocks_after,
-            "seconds_after_launch": seconds_after,
             "bot_score": bot_score,
             "archetype": archetype,
+            "category": category,
             "smart_money_score": smart_money_score,
             "cluster_id": cluster_info.get("cluster_id"),
             "suspicion_score": cluster_info.get("suspicion_score"),
@@ -166,9 +178,10 @@ def _enrich_buyers(
             "in_cluster": in_cluster,
         })
 
+    # Sort: cluster members first, then by blocks_after_launch ascending
     enriched.sort(key=lambda b: (
         0 if b.get("in_cluster") else 1,
-        b.get("blocks_after_launch") if b.get("blocks_after_launch") is not None else 9999,
+        b.get("blocks_after_launch", 9999),
     ))
 
     return enriched
@@ -176,37 +189,51 @@ def _enrich_buyers(
 
 @router.get("/{ca}", summary="Full token analysis")
 async def token_analysis(ca: str) -> Dict[str, Any]:
-    _validate_ca(ca)
     helius = get_helius_client()
 
-    token_info, early_full = await asyncio.gather(
-        helius.get_token_info(ca),
-        helius.get_early_buyers_full(ca),
+    meta, early_buyers, supply, sol_price = await asyncio.gather(
+        helius.get_token_metadata(ca),
+        helius.get_early_buyers(ca),
+        helius.get_token_supply(ca),
+        helius.get_sol_price_usd(),
     )
 
-    early_buyers = early_full.get("buyers", [])
-    launch_ts = early_full.get("launch_timestamp")
-    launch_slot = early_full.get("launch_slot")
-    dev_wallet = token_info.get("update_authority")
+    dev_wallet = None
+    if isinstance(meta, dict):
+        on_chain = meta.get("onChainMetadata") or {}
+        dev_wallet = (
+            on_chain.get("updateAuthority")
+            or meta.get("owner")
+            or meta.get("developer")
+        )
 
     cabal, dev_risk = await asyncio.gather(
         analyze_cabal(ca, early_buyers),
-        _get_dev_risk(dev_wallet, ca=ca, launch_ts=launch_ts),
+        _get_dev_risk(dev_wallet),
     )
 
-    enriched = _enrich_buyers(early_buyers, cabal, launch_slot, launch_ts)
+    enriched = _enrich_buyers(early_buyers, cabal, token_supply=supply, sol_price_usd=sol_price)
+
+    counts = {
+        "smart_money": sum(1 for b in enriched if b["category"] == "smart_money"),
+        "bots": sum(1 for b in enriched if b["category"] == "bot"),
+        "cluster_members": sum(1 for b in enriched if b["category"] == "cluster"),
+        "regular": sum(1 for b in enriched if b["category"] == "regular"),
+    }
+
+    on_chain_meta = (meta.get("onChainMetadata") or {}) if isinstance(meta, dict) else {}
+    # Helius token-metadata nests name/symbol under metadata.data on some plans
+    nested = (on_chain_meta.get("metadata") or {}).get("data") or {}
 
     return {
         "ca": ca,
-        "name": token_info.get("name"),
-        "symbol": token_info.get("symbol"),
-        "supply": token_info.get("supply_ui"),
-        "decimals": token_info.get("decimals"),
-        "sol_price_usd": early_full.get("sol_price_usd"),
-        "launch_timestamp": launch_ts,
-        "history_complete": early_full.get("history_complete", False),
+        "name": on_chain_meta.get("name") or nested.get("name"),
+        "symbol": on_chain_meta.get("symbol") or nested.get("symbol"),
+        "token_supply": supply,
+        "sol_price_usd": round(sol_price, 2),
         "early_buyers_count": len(early_buyers),
-        "early_buyers": enriched[:100],
+        "buyer_counts": counts,
+        "early_buyers": enriched[:50],
         "cabal": cabal,
         "dev_risk": dev_risk,
     }
@@ -214,32 +241,26 @@ async def token_analysis(ca: str) -> Dict[str, Any]:
 
 @router.get("/{ca}/early-buyers", summary="Paginated early buyers list")
 async def token_early_buyers(ca: str, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
-    _validate_ca(ca)
-    limit = max(1, min(limit, 200))
-    offset = max(0, offset)
-
     helius = get_helius_client()
-    early_full = await helius.get_early_buyers_full(ca)
-    early_buyers = early_full.get("buyers", [])
-    cabal = await analyze_cabal(ca, early_buyers)
-    enriched = _enrich_buyers(
-        early_buyers, cabal,
-        early_full.get("launch_slot"), early_full.get("launch_timestamp"),
+    early_buyers, supply, sol_price = await asyncio.gather(
+        helius.get_early_buyers(ca),
+        helius.get_token_supply(ca),
+        helius.get_sol_price_usd(),
     )
+    cabal = await analyze_cabal(ca, early_buyers)
+    enriched = _enrich_buyers(early_buyers, cabal, token_supply=supply, sol_price_usd=sol_price)
     page = enriched[offset: offset + limit]
     return {
         "ca": ca,
         "total": len(early_buyers),
         "limit": limit,
         "offset": offset,
-        "history_complete": early_full.get("history_complete", False),
         "buyers": page,
     }
 
 
 @router.get("/{ca}/cabal", summary="Cabal cluster analysis")
 async def token_cabal(ca: str) -> Dict[str, Any]:
-    _validate_ca(ca)
     helius = get_helius_client()
     early_buyers = await helius.get_early_buyers(ca)
     return await analyze_cabal(ca, early_buyers)
@@ -247,14 +268,10 @@ async def token_cabal(ca: str) -> Dict[str, Any]:
 
 @router.get("/{ca}/dev-risk", summary="Dev wallet risk score")
 async def token_dev_risk(ca: str) -> Dict[str, Any]:
-    _validate_ca(ca)
     helius = get_helius_client()
-    token_info, early_full = await asyncio.gather(
-        helius.get_token_info(ca),
-        helius.get_early_buyers_full(ca),
-    )
-    return await _get_dev_risk(
-        token_info.get("update_authority"),
-        ca=ca,
-        launch_ts=early_full.get("launch_timestamp"),
-    )
+    meta = await helius.get_token_metadata(ca)
+    dev_wallet = None
+    if isinstance(meta, dict):
+        on_chain = meta.get("onChainMetadata") or {}
+        dev_wallet = on_chain.get("updateAuthority") or meta.get("owner")
+    return await _get_dev_risk(dev_wallet)

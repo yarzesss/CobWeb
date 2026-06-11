@@ -16,6 +16,12 @@ export function WalletStats({ profile }: { profile: WalletProfile }) {
 
   return (
     <div className="space-y-4">
+      {profile.total_trades === 0 && (
+        <div className="border-2 border-cobweb-amber/50 bg-cobweb-amber/10 p-3 font-mono text-xs text-cobweb-amber">
+          No swap activity found in the last {''}500 transactions of this wallet.
+          Scores below are based on transfer heuristics only.
+        </div>
+      )}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         {stats.map((s) => (
           <div

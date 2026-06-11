@@ -5,6 +5,7 @@ const ARCHETYPE_STYLES: Record<Archetype, string> = {
   sniper: 'bg-cobweb-amber/20 text-cobweb-amber border-cobweb-amber/50',
   insider: 'bg-cobweb-red/20 text-cobweb-red border-cobweb-red/50',
   swing: 'bg-blue-500/20 text-blue-400 border-blue-500/50',
+  swing_trader: 'bg-blue-500/20 text-blue-400 border-blue-500/50',
   accumulator: 'bg-cobweb-mint/20 text-cobweb-mint border-cobweb-mint/50',
   flipper: 'bg-orange-500/20 text-orange-400 border-orange-500/50',
   bot: 'bg-gray-500/20 text-gray-400 border-gray-500/50',
@@ -48,7 +49,7 @@ export function ArchetypeBadge({ archetype }: { archetype: Archetype }) {
         ARCHETYPE_STYLES[archetype] ?? ARCHETYPE_STYLES.unknown,
       )}
     >
-      {archetype}
+      {archetype.replace('_', ' ')}
     </span>
   );
 }

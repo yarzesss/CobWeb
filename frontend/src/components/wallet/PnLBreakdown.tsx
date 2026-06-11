@@ -42,8 +42,10 @@ export function PnLBreakdown({ pnl }: { pnl: WalletPnl }) {
               <thead>
                 <tr className="border-b border-cobweb-border text-gray-500">
                   <th className="py-2 text-left">Token</th>
-                  <th className="py-2 text-right">PnL</th>
-                  <th className="py-2 text-right">Trades</th>
+                  <th className="py-2 text-right">PnL (USD)</th>
+                  <th className="py-2 text-right">PnL (SOL)</th>
+                  <th className="py-2 text-right">Buys</th>
+                  <th className="py-2 text-right">Sells</th>
                 </tr>
               </thead>
               <tbody>
@@ -53,7 +55,11 @@ export function PnLBreakdown({ pnl }: { pnl: WalletPnl }) {
                     <td className={`py-2 text-right ${t.realized_usd >= 0 ? 'text-cobweb-mint' : 'text-cobweb-red'}`}>
                       {formatUsd(t.realized_usd)}
                     </td>
-                    <td className="py-2 text-right text-gray-400">{t.trades}</td>
+                    <td className={`py-2 text-right ${(t.sol_pnl ?? 0) >= 0 ? 'text-cobweb-mint' : 'text-cobweb-red'}`}>
+                      {t.sol_pnl != null ? `${t.sol_pnl > 0 ? '+' : ''}${t.sol_pnl.toFixed(3)}` : '—'}
+                    </td>
+                    <td className="py-2 text-right text-gray-400">{t.buys ?? '—'}</td>
+                    <td className="py-2 text-right text-gray-400">{t.sells ?? '—'}</td>
                   </tr>
                 ))}
               </tbody>
