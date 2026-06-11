@@ -1,14 +1,34 @@
-"""Helius API client for Cobweb backend."""
 from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 from app.config import settings
 from app.core.cache import get_json, set_json
+
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+
+# Addresses that must never be counted as "buyers" — programs, DEX
+# authorities, fee vaults. tokenTransfers.toUserAccount can resolve to
+# these for pool-side legs of a swap.
+NON_BUYER_ADDRESSES: set[str] = {
+    "11111111111111111111111111111111",                  # System Program
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",       # SPL Token
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",       # Token-2022
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",      # Associated Token
+    "ComputeBudget111111111111111111111111111111",        # Compute Budget
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",       # pump.fun program
+    "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM",      # pump.fun fee
+    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",       # pump.fun AMM
+    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",      # Raydium authority v4
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",      # Raydium AMM v4
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",      # Raydium CLMM
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",       # Orca Whirlpool
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",       # Jupiter v6
+}
 
 
 class HeliusClient:
@@ -58,10 +78,53 @@ class HeliusClient:
         if self._client:
             await self._client.aclose()
 
+    # ─── SOL price (USD) ─────────────────────────────────────────────────────
+
+    async def get_sol_price_usd(self) -> Optional[float]:
+        """Current SOL/USD price. Jupiter → CoinGecko fallback, 60s cache."""
+        cache_key = "price:sol_usd"
+        cached = await get_json(cache_key)
+        if cached is not None:
+            return float(cached)
+
+        price: Optional[float] = None
+
+        # 1) Jupiter price API
+        data = await self._get(
+            "https://lite-api.jup.ag/price/v2",
+            params={"ids": WSOL_MINT},
+        )
+        try:
+            if isinstance(data, dict) and not data.get("error"):
+                entry = (data.get("data") or {}).get(WSOL_MINT) or {}
+                raw = entry.get("price") or entry.get("usdPrice")
+                if raw is not None:
+                    price = float(raw)
+        except (TypeError, ValueError):
+            price = None
+
+        # 2) CoinGecko fallback
+        if price is None:
+            data = await self._get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": "solana", "vs_currencies": "usd"},
+            )
+            try:
+                if isinstance(data, dict) and not data.get("error"):
+                    raw = (data.get("solana") or {}).get("usd")
+                    if raw is not None:
+                        price = float(raw)
+            except (TypeError, ValueError):
+                price = None
+
+        if price is not None and price > 0:
+            await set_json(cache_key, price, ttl=settings.SOL_PRICE_CACHE_TTL)
+        return price
+
     # ─── Token ───────────────────────────────────────────────────────────────
 
     async def get_token_metadata(self, ca: str) -> Dict[str, Any]:
-        """Fetch token name, symbol, decimals, supply via Helius DAS API."""
+        """Raw token metadata via Helius token-metadata endpoint."""
         cache_key = f"token:{ca}:metadata"
         cached = await get_json(cache_key)
         if cached is not None:
@@ -78,6 +141,58 @@ class HeliusClient:
         await set_json(cache_key, result, ttl=settings.CACHE_TTL_TOKEN)
         return result
 
+    async def get_token_info(self, ca: str) -> Dict[str, Any]:
+        """
+        Normalized token info parsed from Helius metadata:
+        { ca, name, symbol, decimals, supply_ui, update_authority }
+        """
+        meta = await self.get_token_metadata(ca)
+        info: Dict[str, Any] = {
+            "ca": ca,
+            "name": None,
+            "symbol": None,
+            "decimals": None,
+            "supply_ui": None,
+            "update_authority": None,
+        }
+        if not isinstance(meta, dict) or meta.get("error"):
+            return info
+
+        on_chain_meta = (meta.get("onChainMetadata") or {}).get("metadata") or {}
+        meta_data = on_chain_meta.get("data") or {}
+        off_chain = (meta.get("offChainMetadata") or {}).get("metadata") or {}
+        legacy = meta.get("legacyMetadata") or {}
+
+        info["name"] = (
+            (meta_data.get("name") or "").strip()
+            or (off_chain.get("name") or "").strip()
+            or (legacy.get("name") or "").strip()
+            or None
+        )
+        info["symbol"] = (
+            (meta_data.get("symbol") or "").strip()
+            or (off_chain.get("symbol") or "").strip()
+            or (legacy.get("symbol") or "").strip()
+            or None
+        )
+        info["update_authority"] = on_chain_meta.get("updateAuthority")
+
+        parsed_info = (
+            ((meta.get("onChainAccountInfo") or {}).get("accountInfo") or {})
+            .get("data", {})
+            .get("parsed", {})
+            .get("info", {})
+        )
+        try:
+            decimals = int(parsed_info.get("decimals"))
+            supply_raw = int(parsed_info.get("supply"))
+            info["decimals"] = decimals
+            info["supply_ui"] = supply_raw / (10 ** decimals) if decimals >= 0 else None
+        except (TypeError, ValueError):
+            pass
+
+        return info
+
     async def get_token_largest_accounts(self, ca: str) -> List[Dict[str, Any]]:
         """Top holders of a token via Helius RPC."""
         cache_key = f"token:{ca}:largest_accounts"
@@ -93,101 +208,207 @@ class HeliusClient:
             "params": [ca],
         })
 
-        result = data.get("result", {}).get("value", [])
+        result = data.get("result", {}).get("value", []) if isinstance(data, dict) else []
         await set_json(cache_key, result, ttl=settings.CACHE_TTL_TOKEN)
         return result
 
-    async def get_early_buyers(
-        self, ca: str, max_mcap_usd: int = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Find wallets that bought the token very early (near launch).
+    # ─── Early buyers ─────────────────────────────────────────────────────────
 
-        Strategy:
-        - Fetch all transactions for the token CA sorted by time
-        - Extract unique buyers from token transfer events (toUserAccount)
-        - The first N unique buyers are considered "early" — bought at lowest mcap
-        - Returns list of dicts: {wallet, tx_signature, slot, timestamp}
+    @staticmethod
+    def _wallet_sol_spent_in_tx(tx: Dict[str, Any], wallet: str) -> float:
+        """How much SOL the wallet paid in this tx (positive number, in SOL)."""
+        # 1) Parsed swap event — most accurate
+        swap = (tx.get("events") or {}).get("swap") or {}
+        ni = swap.get("nativeInput") or {}
+        if ni.get("account") == wallet:
+            try:
+                return int(ni.get("amount") or 0) / 1e9
+            except (TypeError, ValueError):
+                pass
+
+        # 2) Account-level native balance change
+        for acc in tx.get("accountData") or []:
+            if acc.get("account") == wallet:
+                change = acc.get("nativeBalanceChange") or 0
+                if change < 0:
+                    return -change / 1e9
+                break
+
+        # 3) Native transfers fallback
+        spent = 0
+        for nt in tx.get("nativeTransfers") or []:
+            if nt.get("fromUserAccount") == wallet:
+                spent += nt.get("amount") or 0
+            if nt.get("toUserAccount") == wallet:
+                spent -= nt.get("amount") or 0
+        return max(0.0, spent / 1e9)
+
+    async def get_early_buyers_full(
+        self, ca: str, max_mcap_usd: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Find wallets that genuinely BOUGHT the token early (paid SOL,
+        received the token), with entry market cap and amounts.
+
+        Returns:
+        {
+          "buyers": [
+            { wallet, tx_signature, slot, timestamp,
+              token_amount, sol_spent, amount_usd,
+              entry_mcap_usd, entry_price_sol }
+          ],
+          "launch_timestamp": int | None,
+          "launch_slot": int | None,
+          "history_complete": bool,   # did we reach the token's first tx
+          "sol_price_usd": float | None,
+        }
         """
         if max_mcap_usd is None:
             max_mcap_usd = settings.EARLY_BUY_MARKET_CAP_USD
 
-        cache_key = f"token:{ca}:early_buyers"
+        cache_key = f"token:{ca}:early_buyers:v2"
         cached = await get_json(cache_key)
         if cached is not None:
             return cached
 
-        txs = await self._fetch_all_transactions(ca, limit=1000)
-        if not txs:
-            await set_json(cache_key, [], ttl=settings.CACHE_TTL_TOKEN)
-            return []
+        token_info, sol_price = await asyncio.gather(
+            self.get_token_info(ca),
+            self.get_sol_price_usd(),
+        )
+        supply_ui = token_info.get("supply_ui")
 
-        # Sort by timestamp ascending — earliest first
-        txs.sort(key=lambda t: t.get("timestamp", 0))
+        txs, reached_genesis = await self._fetch_transaction_history(
+            ca, max_pages=settings.HELIUS_MAX_TX_PAGES
+        )
+
+        empty = {
+            "buyers": [],
+            "launch_timestamp": None,
+            "launch_slot": None,
+            "history_complete": reached_genesis,
+            "sol_price_usd": sol_price,
+        }
+        if not txs:
+            await set_json(cache_key, empty, ttl=settings.CACHE_TTL_TOKEN)
+            return empty
+
+        # Oldest first — these are the earliest available transactions.
+        txs.sort(key=lambda t: (t.get("timestamp") or 0, t.get("slot") or 0))
+
+        launch_ts = next((t.get("timestamp") for t in txs if t.get("timestamp")), None)
+        launch_slot = next((t.get("slot") for t in txs if t.get("slot")), None)
 
         seen_wallets: set[str] = set()
-        early_buyers: List[Dict[str, Any]] = []
+        buyers: List[Dict[str, Any]] = []
+        consecutive_above_cap = 0
 
         for tx in txs:
-            # Parse token transfers — we want buyers (toUserAccount)
-            for transfer in tx.get("tokenTransfers", []):
+            if len(buyers) >= settings.MAX_EARLY_BUYERS:
+                break
+            if consecutive_above_cap >= 25:
+                break  # price has clearly moved past the early-buy window
+
+            for transfer in tx.get("tokenTransfers") or []:
                 if transfer.get("mint") != ca:
                     continue
                 buyer = transfer.get("toUserAccount")
-                if not buyer or buyer in seen_wallets:
+                if (
+                    not buyer
+                    or buyer in seen_wallets
+                    or buyer == ca
+                    or buyer in NON_BUYER_ADDRESSES
+                ):
                     continue
-                # Skip if it's the token's own CA or a known DEX vault
-                if buyer == ca:
+
+                try:
+                    token_amount = float(transfer.get("tokenAmount") or 0)
+                except (TypeError, ValueError):
+                    token_amount = 0.0
+                if token_amount <= 0:
                     continue
+
+                sol_spent = self._wallet_sol_spent_in_tx(tx, buyer)
+                if sol_spent <= 0.0005:
+                    # No SOL paid → airdrop / internal transfer, not a buy
+                    continue
+
+                entry_price_sol = sol_spent / token_amount
+                entry_mcap_usd: Optional[float] = None
+                amount_usd: Optional[float] = None
+                if sol_price:
+                    amount_usd = sol_spent * sol_price
+                    if supply_ui:
+                        entry_mcap_usd = entry_price_sol * supply_ui * sol_price
+
+                if entry_mcap_usd is not None and entry_mcap_usd > max_mcap_usd:
+                    consecutive_above_cap += 1
+                    continue
+                consecutive_above_cap = 0
+
                 seen_wallets.add(buyer)
-                early_buyers.append({
+                buyers.append({
                     "wallet": buyer,
                     "tx_signature": tx.get("signature"),
                     "slot": tx.get("slot"),
                     "timestamp": tx.get("timestamp"),
-                    "amount": transfer.get("tokenAmount", 0),
+                    "token_amount": token_amount,
+                    "sol_spent": round(sol_spent, 6),
+                    "amount_usd": round(amount_usd, 2) if amount_usd is not None else None,
+                    "entry_price_sol": entry_price_sol,
+                    "entry_mcap_usd": round(entry_mcap_usd, 2) if entry_mcap_usd is not None else None,
                 })
 
-        await set_json(cache_key, early_buyers, ttl=settings.CACHE_TTL_TOKEN)
-        return early_buyers
+        result = {
+            "buyers": buyers,
+            "launch_timestamp": launch_ts,
+            "launch_slot": launch_slot,
+            "history_complete": reached_genesis,
+            "sol_price_usd": sol_price,
+        }
+        await set_json(cache_key, result, ttl=settings.CACHE_TTL_TOKEN)
+        return result
+
+    async def get_early_buyers(
+        self, ca: str, max_mcap_usd: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """Back-compat helper returning only the buyers list."""
+        full = await self.get_early_buyers_full(ca, max_mcap_usd)
+        return full.get("buyers", [])
 
     # ─── Wallet ───────────────────────────────────────────────────────────────
 
     async def get_wallet_transactions(
         self, wallet_address: str, limit: int = 100
     ) -> List[Dict[str, Any]]:
-        """Fetch parsed transaction history for a wallet via Helius Enhanced Transactions."""
-        cache_key = f"wallet:{wallet_address}:transactions"
+        """Parsed transaction history for a wallet (newest first)."""
+        cache_key = f"wallet:{wallet_address}:transactions:{limit}"
         cached = await get_json(cache_key)
         if cached is not None:
             return cached
 
-        result = await self._fetch_all_transactions(wallet_address, limit=limit)
+        max_pages = max(1, (limit + 99) // 100)
+        txs, _ = await self._fetch_transaction_history(wallet_address, max_pages=max_pages)
+        result = txs[:limit]
         await set_json(cache_key, result, ttl=settings.CACHE_TTL_WALLET)
         return result
 
     async def get_wallet_sol_transfers(
         self, wallet_address: str, limit: int = 1000
     ) -> List[Dict[str, Any]]:
-        """
-        Extract only native SOL transfers from wallet history.
-        Uses nativeTransfers field from Helius Enhanced Transactions.
-        Returns: [{fromUserAccount, toUserAccount, amount (lamports), timestamp}]
-        """
+        """Native SOL transfers touching this wallet."""
         cache_key = f"wallet:{wallet_address}:sol_transfers"
         cached = await get_json(cache_key)
         if cached is not None:
             return cached
 
-        txs = await self._fetch_all_transactions(wallet_address, limit=limit)
+        txs = await self.get_wallet_transactions(wallet_address, limit=limit)
         sol_transfers: List[Dict[str, Any]] = []
 
         for tx in txs:
-            for transfer in tx.get("nativeTransfers", []):
+            for transfer in tx.get("nativeTransfers") or []:
                 from_acc = transfer.get("fromUserAccount")
                 to_acc = transfer.get("toUserAccount")
                 amount = transfer.get("amount", 0)
-                # Only include transfers where our wallet is sender or receiver
                 if wallet_address not in (from_acc, to_acc):
                     continue
                 sol_transfers.append({
@@ -203,7 +424,7 @@ class HeliusClient:
         return sol_transfers
 
     async def get_transaction_detail(self, signature: str) -> Dict[str, Any]:
-        """Fetch full detail of a single transaction."""
+        """Full detail of a single transaction."""
         cache_key = f"tx:{signature}:detail"
         cached = await get_json(cache_key)
         if cached is not None:
@@ -221,12 +442,15 @@ class HeliusClient:
 
     # ─── Internal ─────────────────────────────────────────────────────────────
 
-    async def _fetch_all_transactions(
-        self, address: str, limit: int = 100
-    ) -> List[Dict[str, Any]]:
+    async def _fetch_transaction_history(
+        self, address: str, max_pages: int = 10
+    ) -> Tuple[List[Dict[str, Any]], bool]:
         """
-        Paginate through Helius Enhanced Transactions API.
-        Helius returns max 100 per page — uses `before` cursor for pagination.
+        Paginate Helius Enhanced Transactions (newest → oldest, `before` cursor).
+
+        Returns (transactions, reached_genesis). reached_genesis=True means we
+        walked all the way back to the address's first transaction, so the
+        oldest items in the list really are the earliest on-chain activity.
         """
         url = (
             f"{settings.HELIUS_API_URL}/addresses/{address}/transactions"
@@ -234,10 +458,10 @@ class HeliusClient:
         )
         all_txs: List[Dict[str, Any]] = []
         before: Optional[str] = None
-        page_size = min(100, limit)
+        reached_genesis = False
 
-        while len(all_txs) < limit:
-            params: Dict[str, Any] = {"limit": page_size}
+        for _ in range(max_pages):
+            params: Dict[str, Any] = {"limit": 100}
             if before:
                 params["before"] = before
 
@@ -246,16 +470,18 @@ class HeliusClient:
             if isinstance(data, dict) and data.get("error"):
                 break
             if not isinstance(data, list) or not data:
+                reached_genesis = True
                 break
 
             all_txs.extend(data)
 
-            if len(data) < page_size:
-                break  # no more pages
+            if len(data) < 100:
+                reached_genesis = True
+                break
 
             before = data[-1].get("signature")
 
-        return all_txs[:limit]
+        return all_txs, reached_genesis
 
 
 # ─── Singleton ────────────────────────────────────────────────────────────────

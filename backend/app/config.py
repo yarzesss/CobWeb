@@ -8,8 +8,8 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     DEBUG: bool = True
 
-    # Database
-    DATABASE_URL: str
+    # Database (поки що не використовується роутерами — watchlist живе в Redis)
+    DATABASE_URL: str = "postgresql+asyncpg://cobweb:cobweb@postgres:5432/cobweb"
 
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -38,6 +38,15 @@ class Settings(BaseSettings):
 
     # Early buyers
     EARLY_BUY_MARKET_CAP_USD: int = 10000  # поріг "ранній покупець" — 10k капа
+    MAX_TX_PAGES_FOR_EARLY_BUYERS: int = 30  # макс. сторінок історії (30 × 100 = 3000 tx)
+    MAX_EARLY_BUYERS: int = 150  # скільки перших унікальних покупців вважаємо "ранніми"
+
+    # Prices
+    CACHE_TTL_PRICE: int = 60                # 1 хвилина — ціна SOL
+    SOL_PRICE_FALLBACK_USD: float = 150.0    # якщо всі price API недоступні
+
+    # CORS
+    FRONTEND_ORIGIN: str = "https://cobweb.so"
 
     class Config:
         env_file = ".env"
